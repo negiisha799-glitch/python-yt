@@ -1,0 +1,12 @@
+x = 9
+y = 7
+addition = x + y
+subtraction = x - y
+multiplication = x * y
+division = x / y
+modulus = x // y
+print("value addition = ", addition)
+print("value subtraction = ", subtraction)
+print("value multiplication = ", multiplication)
+print("value division = ", division)
+print("value modulus = ", modulus)
