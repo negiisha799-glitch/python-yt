@@ -1,6 +1,6 @@
 # Input a number
 num = int(input("Enter a number: "))
-
+ 
 # Check if multiple of 5
 if num % 5 == 0:
     print(num, "is a multiple of 5")
