@@ -1,0 +1,25 @@
+with open("name.txt","w") as f:
+  f.write("Aman\n")
+  f.write("Isha\n")
+  f.write("Rohit\n")
+  f.write("Ankit\n")
+  f.write("Om\n")
+
+
+
+with open("name.txt","r") as f:
+  names = f.readlines()
+
+  
+  names = [name.strip() for name in names]
+
+  total=len(names)
+
+  vowels = "AEIOUaeiou"
+  vowel_count = sum(1 for name in names if name and name[0] in vowels)
+
+  longest = max(names, key=len)
+
+  print("Total names: ", total)
+  print("Names starting with vowel: ", vowel_count)
+  print("Longest name: ",longest)
