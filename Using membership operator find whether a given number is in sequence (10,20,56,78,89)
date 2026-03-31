@@ -5,4 +5,4 @@ num = int(input("Enter a number: "))
 if num in sequence:
   print(num, "is present in sequence")
   else:
-    print(num, "is not present in the sequence")
+    print(num, "is not present in the sequence") 
