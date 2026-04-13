@@ -5,8 +5,6 @@ with open("name.txt","w") as f:
   f.write("Ankit\n")
   f.write("Om\n")
 
-
-
 with open("name.txt","r") as f:
   names = f.readlines()
 
