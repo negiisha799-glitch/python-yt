@@ -1,0 +1,992 @@
+# ================================
+#  train_model.py
+#  Trains the Crop Disease Detector
+#  Run AFTER make_dataset.py
+# ================================
+#
+#  ORDER TO RUN:
+#    1. python make_dataset.py    <- generates leaf images (no internet!)
+#    2. python train_model.py     <- this file, trains the model
+#    3. python gui_app.py         <- run the finished GUI
+#
+# ================================
+
+import os
+import json
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from tensorflow import keras
+
+# -------------------------------------------------------
+# SETTINGS
+# -------------------------------------------------------
+
+DATASET_FOLDER = "PlantVillage"
+IMAGE_SIZE     = (128, 128)
+BATCH_SIZE     = 32
+EPOCHS         = 20
+MODEL_FILE     = "disease_model.h5"
+CLASSES_FILE   = "class_names.json"
+
+# -------------------------------------------------------
+# STEP 1 — CHECK DATASET
+# -------------------------------------------------------
+
+if not os.path.exists(DATASET_FOLDER):
+    print(f"\nERROR: '{DATASET_FOLDER}' folder not found!")
+    print("Run  python make_dataset.py  first.\n")
+    exit()
+
+print("=" * 55)
+print("  Crop Disease Detector — Training")
+print("=" * 55)
+
+# -------------------------------------------------------
+# STEP 2 — LOAD IMAGES WITH 80 / 20 SPLIT
+# -------------------------------------------------------
+# 
+# ImageDataGenerator reads images from sub-folders.
+# Each sub-folder name = one class label.
+#
+# validation_split=0.2  means:
+#   80% -> training   (model learns from these)
+#   20% -> testing    (we check accuracy on these, model never trained on them)
+#
+# seed=42 ensures the SAME images always go to train vs test.
+
+print("\nLoading images  (80% train / 20% test) ...")
+
+# Training loader — includes data augmentation to create variety
+train_datagen = keras.preprocessing.image.ImageDataGenerator(
+    rescale            = 1.0 / 255,    # pixels 0-255 -> 0.0-1.0
+    validation_split   = 0.2,          # hold back 20% for testing
+    horizontal_flip    = True,         # randomly mirror left-right
+    vertical_flip      = False,
+    rotation_range     = 15,           # randomly rotate up to 15 degrees
+    zoom_range         = 0.12,         # randomly zoom in/out
+    width_shift_range  = 0.08,
+    height_shift_range = 0.08,
+    brightness_range   = [0.85, 1.15], # slightly vary brightness
+)
+
+# Test loader — NO augmentation, just normalize pixels
+test_datagen = keras.preprocessing.image.ImageDataGenerator(
+    rescale          = 1.0 / 255,
+    validation_split = 0.2,
+)
+
+train_gen = train_datagen.flow_from_directory(
+    DATASET_FOLDER,
+    target_size = IMAGE_SIZE,
+    batch_size  = BATCH_SIZE,
+    class_mode  = "categorical",
+    subset      = "training",    # <- 80% portion
+    shuffle     = True,
+    seed        = 42,
+)
+
+test_gen = test_datagen.flow_from_directory(
+    DATASET_FOLDER,
+    target_size = IMAGE_SIZE,
+    batch_size  = BATCH_SIZE,
+    class_mode  = "categorical",
+    subset      = "validation",  # <- 20% portion
+    shuffle     = False,
+    seed        = 42,
+)
+
+num_classes = len(train_gen.class_indices)
+
+# Print summary table using pandas
+df_split = pd.DataFrame({
+    "Split"  : ["Training (80%)", "Testing  (20%)"],
+    "Images" : [train_gen.samples, test_gen.samples],
+    "Batches": [len(train_gen),    len(test_gen)],
+})
+print("\n" + df_split.to_string(index=False))
+print(f"\n  Classes found : {num_classes}")
+
+# Save class name map  ->  {\"0\": \"Plant__Healthy\", \"1\": \"Plant__Early_Blight\", ...}
+index_to_name = {str(v): k for k, v in train_gen.class_indices.items()}
+with open(CLASSES_FILE, "w") as f:
+    json.dump(index_to_name, f, indent=2)
+print(f"  Class map saved -> {CLASSES_FILE}")
+
+# -------------------------------------------------------
+# STEP 3 — BUILD MODEL  (Transfer Learning)
+# -------------------------------------------------------
+#
+# MobileNetV2 is pre-trained on 1.2 million real photos.
+# We reuse its image understanding and just add our own
+# output layer for 6 plant disease classes.
+
+print("\nBuilding model (MobileNetV2 + custom head)...")
+
+base = keras.applications.MobileNetV2(
+    input_shape = (*IMAGE_SIZE, 3),
+    include_top = False,        # remove original 1000-class output
+    weights     = "imagenet",
+)
+base.trainable = False          # keep base frozen at first
+
+model = keras.Sequential([
+    base,
+    keras.layers.GlobalAveragePooling2D(),
+    keras.layers.Dense(256, activation="relu"),
+    keras.layers.Dropout(0.35),
+    keras.layers.Dense(128, activation="relu"),
+    keras.layers.Dropout(0.2),
+    keras.layers.Dense(num_classes, activation="softmax"),
+])
+
+model.compile(
+    optimizer = keras.optimizers.Adam(learning_rate=0.001),
+    loss      = "categorical_crossentropy",
+    metrics   = ["accuracy"],
+)
+
+trainable = sum(keras.backend.count_params(w) for w in model.trainable_weights)
+total     = model.count_params()
+print(f"  Trainable params : {trainable:,}  (our layers only)")
+print(f"  Total params     : {total:,}")
+# -------------------------------------------------------
+# STEP 4 — TRAIN
+# -------------------------------------------------------
+
+print(f"\nTraining (max {EPOCHS} epochs, early stop if no improvement)...\n")
+
+history = model.fit(
+    train_gen,
+    validation_data = test_gen,
+    epochs          = EPOCHS,
+    callbacks = [
+        keras.callbacks.ModelCheckpoint(
+            MODEL_FILE, save_best_only=True,
+            monitor="val_accuracy", verbose=1,
+        ),
+        keras.callbacks.EarlyStopping(
+            patience=5, restore_best_weights=True,
+            monitor="val_accuracy", verbose=1,
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5,
+            patience=3, verbose=1,
+        ),
+    ],
+)
+
+# -------------------------------------------------------
+# STEP 5 — EVALUATE ON TEST SET
+# -------------------------------------------------------
+
+print("\nEvaluating on test set (20% unseen images)...")
+test_loss, test_acc = model.evaluate(test_gen, verbose=0)
+print(f"  Test Accuracy : {test_acc * 100:.2f}%")
+print(f"  Test Loss     : {test_loss:.4f}")
+# -------------------------------------------------------
+# STEP 6 — SAVE TRAINING GRAPH  (matplotlib + pandas)
+# -------------------------------------------------------
+
+print("\nSaving training graphs...")
+
+# pandas DataFrame of training history
+df_hist = pd.DataFrame({
+    "epoch"      : list(range(1, len(history.history["accuracy"]) + 1)),
+    "train_acc"  : history.history["accuracy"],
+    "val_acc"    : history.history["val_accuracy"],
+    "train_loss" : history.history["loss"],
+    "val_loss"   : history.history["val_loss"],
+})
+
+print("\n  Full training history:")
+print(df_hist.to_string(index=False))
+
+# Plot
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+fig.patch.set_facecolor("#1e1e2e")
+
+for ax in axes:
+    ax.set_facecolor("#12121e")
+    ax.tick_params(colors="white")
+    for sp in ["top", "right"]:
+        ax.spines[sp].set_visible(False)
+    ax.spines["left"].set_color("#444")
+    ax.spines["bottom"].set_color("#444")
+
+# Accuracy chart
+axes[0].plot(df_hist["epoch"], df_hist["train_acc"] * 100,
+             color="#50fa7b", lw=2, marker="o", ms=4, label="Train Acc")
+axes[0].plot(df_hist["epoch"], df_hist["val_acc"] * 100,
+             color="#bd93f9", lw=2, marker="s", ms=4, label="Test Acc")
+axes[0].set_title("Accuracy per Epoch", color="white", fontsize=13, pad=10)
+axes[0].set_xlabel("Epoch", color="#aaa", fontsize=9)
+axes[0].set_ylabel("Accuracy (%)", color="#aaa", fontsize=9)
+axes[0].set_ylim(0, 105)
+axes[0].legend(facecolor="#2a2a3e", labelcolor="white")
+axes[0].grid(True, alpha=0.12)
+
+# Best epoch marker
+best_ep = df_hist["val_acc"].idxmax()
+axes[0].axvline(x=df_hist["epoch"][best_ep], color="#f1fa8c",
+                linestyle="--", alpha=0.6, label=f"Best epoch {best_ep+1}")
+
+# Loss chart
+axes[1].plot(df_hist["epoch"], df_hist["train_loss"],
+             color="#ff5555", lw=2, marker="o", ms=4, label="Train Loss")
+axes[1].plot(df_hist["epoch"], df_hist["val_loss"],
+             color="#f1fa8c", lw=2, marker="s", ms=4, label="Test Loss")
+axes[1].set_title("Loss per Epoch", color="white", fontsize=13, pad=10)
+axes[1].set_xlabel("Epoch", color="#aaa", fontsize=9)
+axes[1].set_ylabel("Loss", color="#aaa", fontsize=9)
+axes[1].legend(facecolor="#2a2a3e", labelcolor="white")
+axes[1].grid(True, alpha=0.12)
+
+best_val_acc  = df_hist["val_acc"].max() * 100
+best_epoch_no = df_hist["val_acc"].idxmax() + 1
+plt.suptitle(
+    f"Training Complete  |  Best Test Accuracy: {best_val_acc:.1f}%  (epoch {best_epoch_no})",
+    color="white", fontsize=12, y=1.01
+)
+
+plt.tight_layout()
+plt.savefig("training_graphs.png", dpi=150, bbox_inches="tight",
+            facecolor="#1e1e2e")
+plt.close()
+print("  Graphs saved -> training_graphs.png")
+
+# -------------------------------------------------------
+# DONE
+# -------------------------------------------------------
+
+print("\n" + "=" * 55)
+print("  Training Complete!")
+print("=" * 55)
+print(f"  Model saved     : {MODEL_FILE}")
+print(f"  Class names     : {CLASSES_FILE}")
+print(f"  Training graph  : training_graphs.png")
+print(f"  Best epoch      : {best_epoch_no}")
+print(f"  Best test acc   : {best_val_acc:.2f}%")
+print(f"  Final test acc  : {test_acc * 100:.2f}%")
+print("=" * 55)
+print("\n  Run next:  python gui_app.py\n")
+
+gui_app.py
+
+# ================================
+#  gui_app.py
+#  Crop Disease Detection GUI
+#  Run: python gui_app.py
+# ================================
+
+import json
+import os
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from PIL import Image, ImageTk
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from tensorflow import keras
+
+# -------------------------------------------------------
+# LOAD MODEL & CLASS NAMES
+# -------------------------------------------------------
+
+MODEL_FILE   = "disease_model.h5"
+CLASSES_FILE = "class_names.json"
+IMAGE_SIZE   = (128, 128)
+
+try:
+    model = keras.models.load_model(MODEL_FILE)
+    print("Model loaded!")
+except Exception as e:
+    model = None
+    print(f"Model not found: {e}")
+
+try:
+    with open(CLASSES_FILE) as f:
+        class_names = json.load(f)
+    print(f"{len(class_names)} classes loaded.")
+except Exception as e:
+    class_names = {}
+    print(f"class_names.json missing: {e}")
+
+
+# -------------------------------------------------------
+# DISEASE DATABASE
+# Matches the 6 classes created by make_dataset.py
+# -------------------------------------------------------
+
+DISEASE_INFO = {
+
+    "healthy": {
+        "label"   : "Healthy Plant",
+        "status"  : "GOOD",
+        "risk"    : 5,
+        "color"   : "#50fa7b",
+        "icon"    : "✅",
+        "summary" : "Your plant is in excellent condition with no signs of disease.",
+        "advice"  : (
+            "No treatment needed — your plant is perfectly healthy right now.\n"
+            "Continue regular watering, ensure 6-8 hours of sunlight daily.\n"
+            "Visit a local nursery once a season for a routine plant health checkup."
+        ),
+        "prevention": (
+            "Maintain good spacing between plants for airflow.\n"
+            "Water at the base, not on leaves, to prevent fungal issues.\n"
+            "Check leaves weekly so you can catch any disease early."
+        ),
+    },
+
+    "early_blight": {
+        "label"   : "Early Blight",
+        "status"  : "DISEASED",
+        "risk"    : 65,
+        "color"   : "#f1fa8c",
+        "icon"    : "⚠️",
+        "summary" : "Dark circular spots with yellow halos detected — Early Blight fungal infection.",
+        "advice"  : (
+            "Remove all leaves showing dark spots immediately to slow the spread.\n"
+            "Spray Chlorothalonil or mancozeb fungicide on all remaining leaves.\n"
+            "Consult a plant doctor if spots keep appearing after 5-7 days of treatment."
+        ),
+        "prevention": (
+            "Rotate crops each season — do not plant in the same soil as last year.\n"
+            "Water early in the morning so leaves dry before evening.\n"
+            "Remove fallen leaves from the ground as they carry fungal spores."
+        ),
+    },
+"late_blight": {
+        "label"   : "Late Blight",
+        "status"  : "DISEASED",
+        "risk"    : 90,
+        "color"   : "#ff5555",
+        "icon"    : "🚨",
+        "summary" : "Large dark water-soaked patches detected — Late Blight, extremely dangerous.",
+        "advice"  : (
+            "URGENT: Remove and destroy ALL infected leaves and stems immediately.\n"
+            "Apply Metalaxyl or Cymoxanil fungicide across all plants in the area.\n"
+            "Consult an agronomist right away — Late Blight can destroy an entire crop."
+        ),
+        "prevention": (
+            "Use certified disease-free seeds and resistant varieties next season.\n"
+            "Avoid dense planting — good airflow reduces moisture that spreads blight.\n"
+            "Apply preventive copper fungicide spray during wet/humid weather periods."
+        ),
+    },
+"powdery_mildew": {
+        "label"   : "Powdery Mildew",
+        "status"  : "DISEASED",
+        "risk"    : 55,
+        "color"   : "#f1fa8c",
+        "icon"    : "⚠️",
+        "summary" : "White powdery coating on leaf surface — Powdery Mildew fungal disease.",
+        "advice"  : (
+            "Spray a solution of potassium bicarbonate or diluted neem oil on all leaves.\n"
+            "Improve airflow by trimming surrounding plants and removing crowded branches.\n"
+            "Consult an agronomist if the white coating continues spreading after one week."
+        ),
+        "prevention": (
+            "Avoid overwatering and do not water at night — moisture feeds this fungus.\n"
+            "Plant in locations with good sunlight and air circulation.\n"
+            "Remove and burn infected leaves and keep the area around plants clean."
+        ),
+    },
+
+    "rust": {
+        "label"   : "Rust Disease",
+        "status"  : "DISEASED",
+        "risk"    : 60,
+        "color"   : "#ffb86c",
+        "icon"    : "⚠️",
+        "summary" : "Orange-brown powdery pustules on leaf surface — Rust fungal disease.",
+        "advice"  : (
+            "Remove all leaves with orange or brown pustule spots and burn them.\n"
+            "Apply sulfur-based fungicide or tebuconazole spray on remaining leaves.\n"
+            "Consult a plant doctor if rust pustules appear on stems and new leaves too."
+        ),
+        "prevention": (
+            "Use rust-resistant seed varieties when planting next season.\n"
+            "Do not leave infected plant debris on the ground after harvest.\n"
+            "Apply preventive sulfur spray during warm humid weather conditions."
+        ),
+    },
+
+    "bacterial_spot": {
+        "label"   : "Bacterial Spot",
+        "status"  : "DISEASED",
+        "risk"    : 70,
+        "color"   : "#ff5555",
+        "icon"    : "🚨",
+        "summary" : "Small dark water-soaked spots with yellow halos — Bacterial Spot infection.",
+        "advice"  : (
+            "Apply copper-based bactericide (copper hydroxide or copper sulfate) spray.\n"
+            "Stop all overhead watering — water only at the base to avoid splash spread.\n"
+            "Consult an agronomist if spots appear on fruits or spread to new leaves."
+        ),
+        "prevention": (
+            "Use certified disease-free seeds and treat seeds before planting.\n"
+            "Avoid working in the garden when plants are wet — bacteria spread easily.\n"
+            "Remove infected plant parts and disinfect garden tools after each use."
+        ),
+    },
+}
+def get_disease_key(class_name):
+    """
+    Maps a class folder name to our DISEASE_INFO key.
+    make_dataset.py uses names like: Plant__Healthy, Plant__Early_Blight
+    We normalize and match.
+    """
+    name = class_name.lower().replace("plant__", "").replace("_", " ").replace("", " ").strip()
+
+    # Most specific keys first to avoid partial match errors
+    ordered = [
+        "bacterial_spot",
+        "powdery_mildew",
+        "early_blight",
+        "late_blight",
+        "healthy",
+        "rust",
+    ]
+    for key in ordered:
+        key_norm = key.replace("_", " ")
+        if key_norm in name:
+            return key
+    return None
+
+
+def get_info(class_name):
+    key = get_disease_key(class_name)
+    if key and key in DISEASE_INFO:
+        return DISEASE_INFO[key]
+    return {
+        "label"    : class_name.replace("Plant__", "").replace("", " ").title(),
+        "status"   : "UNKNOWN",
+        "risk"     : 50,
+        "color"    : "#888888",
+        "icon"     : "❓",
+        "summary"  : "An unrecognized condition was detected.",
+        "advice"   : (
+            "Take a clear close-up photo of the affected leaf in good lighting.\n"
+            "Visit your nearest agricultural extension office or plant clinic.\n"
+            "Consult a certified agronomist for an accurate diagnosis and treatment."
+        ),
+        "prevention": (
+            "Keep the plant area clean and remove any dead or yellowing leaves.\n"
+            "Ensure good sunlight and airflow around all your plants.\n"
+            "Monitor plants weekly and act quickly if any symptoms appear."
+        ),
+    }
+
+
+def get_risk(class_name, confidence):
+    """
+    Risk % = disease_severity_weight × (confidence / 100)
+    So the SAME disease gives different risk values for different images
+    depending on how confident the model actually is.
+    """
+    info   = get_info(class_name)
+    weight = info["risk"]
+    return round(weight * (confidence / 100), 1)
+
+
+# -------------------------------------------------------
+# PREDICT
+# -------------------------------------------------------
+
+def predict(path):
+    img  = Image.open(path).convert("RGB").resize(IMAGE_SIZE)
+    arr  = np.array(img, dtype=np.float32) / 255.0    # numpy: normalize
+    arr  = np.expand_dims(arr, axis=0)                 # numpy: add batch dim
+    preds = model.predict(arr, verbose=0)[0]
+
+    # numpy: sort indices by probability, highest first
+    top5 = np.argsort(preds)[::-1][:5]
+
+    results = []
+    for idx in top5:
+        name  = class_names.get(str(idx), f"Class_{idx}")
+        score = float(preds[idx]) * 100
+        results.append({"class": name, "confidence": round(score, 2)})
+
+    top_name = results[0]["class"]
+    top_conf = results[0]["confidence"]
+    top_risk = get_risk(top_name, top_conf)
+
+    return top_name, top_conf, top_risk, results
+# -------------------------------------------------------
+# DRAW RISK BAR CHART
+# -------------------------------------------------------
+
+def draw_risk_graph(frame, all_preds):
+    """
+    Horizontal bar chart of risk scores for all top-5 predictions.
+    Uses pandas + numpy + matplotlib.
+    """
+    for w in frame.winfo_children():
+        w.destroy()
+
+    # pandas: build table
+    df = pd.DataFrame(all_preds)
+    df["label"] = df["class"].apply(
+        lambda x: x.replace("Plant__", "").replace("_", " – ").replace("", " ").title()
+    )
+    # numpy + pandas: compute risk per row
+    df["risk"] = df.apply(lambda r: get_risk(r["class"], r["confidence"]), axis=1)
+    df["risk"] = np.round(df["risk"], 1)
+    df = df.sort_values("risk", ascending=True)
+
+    colors = [
+        "#ff5555" if v >= 60 else ("#f1fa8c" if v >= 25 else "#50fa7b")
+        for v in df["risk"]
+    ]
+
+    fig, ax = plt.subplots(figsize=(4.5, 2.8))
+    fig.patch.set_facecolor("#1e1e2e")
+    ax.set_facecolor("#12121e")
+
+    bars = ax.barh(df["label"], df["risk"], color=colors, edgecolor="none", height=0.52)
+
+    for bar, val in zip(bars, df["risk"]):
+        ax.text(bar.get_width() + 1, bar.get_y() + bar.get_height() / 2,
+                f"{val:.0f}%", va="center", ha="left", color="white", fontsize=7)
+
+    ax.set_xlim(0, 112)
+    ax.set_xlabel("Risk Level (%)", color="#888", fontsize=8)
+    ax.set_title("Disease Risk Analysis", color="white", fontsize=9, pad=8)
+    ax.tick_params(colors="white", labelsize=7)
+    for sp in ["top", "right"]:
+        ax.spines[sp].set_visible(False)
+    ax.spines["left"].set_color("#444")
+    ax.spines["bottom"].set_color("#444")
+
+    plt.tight_layout(pad=0.9)
+    canvas = FigureCanvasTkAgg(fig, master=frame)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+    plt.close(fig)
+
+
+# -------------------------------------------------------
+# DRAW CLASS DISTRIBUTION PIE CHART
+# -------------------------------------------------------
+
+def draw_class_pie(frame, all_preds):
+    """
+    Pie chart showing confidence split across all top-5 predictions.
+    Uses pandas + matplotlib.
+    """
+    for w in frame.winfo_children():
+        w.destroy()
+
+    df = pd.DataFrame(all_preds)
+    df["label"] = df["class"].apply(
+        lambda x: x.replace("Plant__", "").replace("", " ").title()
+    )
+    # Only show slices with >1% confidence
+    df = df[df["confidence"] > 1.0]
+
+    pie_colors = ["#50fa7b", "#ff5555", "#f1fa8c", "#bd93f9", "#ffb86c"]
+
+    fig, ax = plt.subplots(figsize=(4.5, 2.8))
+    fig.patch.set_facecolor("#1e1e2e")
+    ax.set_facecolor("#1e1e2e")
+
+    wedges, texts, autotexts = ax.pie(
+        df["confidence"],
+        labels      = df["label"],
+        autopct     = "%1.1f%%",
+        colors      = pie_colors[:len(df)],
+        startangle  = 90,
+        textprops   = {"color": "white", "fontsize": 7},
+    )
+    for at in autotexts:
+        at.set_fontsize(7)
+        at.set_color("#1e1e2e")
+
+    ax.set_title("Model Confidence Distribution", color="white", fontsize=9, pad=8)
+
+    plt.tight_layout(pad=0.5)
+    canvas = FigureCanvasTkAgg(fig, master=frame)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+    plt.close(fig)
+# -------------------------------------------------------
+# DRAW TRAINING HISTORY GRAPH
+# -------------------------------------------------------
+
+def draw_training_graph(frame):
+    """
+    Shows training_graphs.png if it exists (saved by train_model.py),
+    otherwise shows a labelled demo chart.
+    """
+    for w in frame.winfo_children():
+        w.destroy()
+
+    if os.path.exists("training_graphs.png"):
+        img   = Image.open("training_graphs.png").resize((460, 270), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(img)
+        lbl   = tk.Label(frame, image=photo, bg="#1e1e2e")
+        lbl.image = photo
+        lbl.pack(expand=True)
+        tk.Label(frame,
+                 text="Real training history from train_model.py",
+                 fg="#555", bg="#1e1e2e", font=("Courier New", 7)).pack()
+        return
+
+    # Demo chart
+    demo_ep    = np.arange(1, 11)
+    demo_train = np.array([0.42, 0.60, 0.71, 0.79, 0.84, 0.87, 0.89, 0.91, 0.92, 0.93])
+    demo_val   = np.array([0.38, 0.55, 0.67, 0.74, 0.80, 0.83, 0.85, 0.87, 0.88, 0.89])
+
+    df_demo = pd.DataFrame({
+        "epoch": demo_ep,
+        "train": demo_train * 100,
+        "val"  : demo_val   * 100,
+    })
+
+    fig, axes = plt.subplots(1, 2, figsize=(4.8, 2.5))
+    fig.patch.set_facecolor("#1e1e2e")
+
+    for ax in axes:
+        ax.set_facecolor("#12121e")
+        ax.tick_params(colors="white", labelsize=6)
+        for sp in ["top", "right"]:
+            ax.spines[sp].set_visible(False)
+        ax.spines["left"].set_color("#444")
+        ax.spines["bottom"].set_color("#444")
+
+    axes[0].plot(df_demo["epoch"], df_demo["train"], color="#50fa7b", lw=2,
+                 marker="o", ms=3, label="Train")
+    axes[0].plot(df_demo["epoch"], df_demo["val"],   color="#bd93f9", lw=2,
+                 marker="s", ms=3, label="Test")
+    axes[0].set_title("Accuracy  (demo)", color="white", fontsize=8)
+    axes[0].set_ylabel("Accuracy (%)", color="#888", fontsize=7)
+    axes[0].set_xlabel("Epoch", color="#888", fontsize=7)
+    axes[0].set_ylim(0, 105)
+    axes[0].legend(facecolor="#2a2a3e", labelcolor="white", fontsize=6)
+    axes[0].grid(True, alpha=0.1)
+
+    demo_tloss = 1 - demo_train * 0.88
+    demo_vloss = 1 - demo_val   * 0.84
+    axes[1].plot(demo_ep, demo_tloss, color="#ff5555", lw=2, marker="o", ms=3, label="Train")
+    axes[1].plot(demo_ep, demo_vloss, color="#f1fa8c", lw=2, marker="s", ms=3, label="Test")
+    axes[1].set_title("Loss  (demo)", color="white", fontsize=8)
+    axes[1].set_ylabel("Loss", color="#888", fontsize=7)
+    axes[1].set_xlabel("Epoch", color="#888", fontsize=7)
+    axes[1].legend(facecolor="#2a2a3e", labelcolor="white", fontsize=6)
+    axes[1].grid(True, alpha=0.1)
+
+    plt.tight_layout(pad=0.8)
+    canvas = FigureCanvasTkAgg(fig, master=frame)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+    plt.close(fig)
+
+    tk.Label(frame,
+             text="Run train_model.py to see your real training graph here",
+             fg="#555", bg="#1e1e2e", font=("Courier New", 7)).pack()
+# -------------------------------------------------------
+# BUTTON ACTIONS
+# -------------------------------------------------------
+
+image_path = None
+
+def _reset_results():
+    result_label.config(text="Upload a leaf image and click Detect", fg="#888888")
+    status_badge.config(text="", bg="#1e1e2e")
+    risk_label.config(text="")
+    summary_label.config(text="")
+    advice_box.config(state="normal")
+    advice_box.delete("1.0", tk.END)
+    advice_box.config(state="disabled")
+    prevent_box.config(state="normal")
+    prevent_box.delete("1.0", tk.END)
+    prevent_box.config(state="disabled")
+    diseases_box.config(state="normal")
+    diseases_box.delete("1.0", tk.END)
+    diseases_box.config(state="disabled")
+
+
+def upload_image():
+    global image_path
+    path = filedialog.askopenfilename(
+        title="Choose a Plant Leaf Image",
+        filetypes=[("Images", "*.jpg *.jpeg *.png")]
+    )
+    if not path:
+        return
+    image_path = path
+
+    img   = Image.open(path).resize((240, 200))
+    photo = ImageTk.PhotoImage(img)
+    img_label.config(image=photo, text="")
+    img_label.image = photo
+
+    _reset_results()
+
+    for w in risk_frame.winfo_children():
+        w.destroy()
+    tk.Label(risk_frame, text="Risk chart appears\nafter detection",
+             fg="#555", bg="#1e1e2e", font=("Courier New", 8)).pack(expand=True)
+
+    for w in pie_frame.winfo_children():
+        w.destroy()
+    tk.Label(pie_frame, text="Confidence chart appears\nafter detection",
+             fg="#555", bg="#1e1e2e", font=("Courier New", 8)).pack(expand=True)
+
+
+def detect():
+    if image_path is None:
+        messagebox.showwarning("No Image", "Please upload a plant leaf image first!")
+        return
+    if model is None:
+        messagebox.showerror("No Model",
+                             "Model not found!\nRun train_model.py first.")
+        return
+
+    top_name, top_conf, top_risk, all_preds = predict(image_path)
+    info = get_info(top_name)
+
+    # ---- Main result ----
+    result_label.config(
+        text=f"{info['icon']}  {info['label']}",
+        fg=info["color"]
+    )
+    status_badge.config(
+        text=f"  {info['status']}  ",
+        fg="#1e1e2e",
+        bg=info["color"],
+        font=("Courier New", 10, "bold")
+    )
+
+    # ---- Risk ----
+    if top_risk < 25:
+        rc = "#50fa7b"
+    elif top_risk < 60:
+        rc = "#f1fa8c"
+    else:
+        rc = "#ff5555"
+    risk_label.config(text=f"Risk Level:  {top_risk}%   |   Confidence:  {top_conf:.1f}%",
+                      fg=rc)
+
+    # ---- Summary ----
+    summary_label.config(text=info["summary"], fg="#cdd6f4")
+
+    # ---- Advice ----
+    advice_box.config(state="normal")
+    advice_box.delete("1.0", tk.END)
+    advice_box.insert("1.0", "TREATMENT ADVICE:\n\n" + info["advice"])
+    advice_box.config(state="disabled")
+
+    # ---- Prevention ----
+    prevent_box.config(state="normal")
+    prevent_box.delete("1.0", tk.END)
+    prevent_box.insert("1.0", "PREVENTION TIPS:\n\n" + info["prevention"])
+    prevent_box.config(state="disabled")
+
+    # ---- Top 5 list ----
+    diseases_box.config(state="normal")
+    diseases_box.delete("1.0", tk.END)
+    diseases_box.insert("1.0", "Top 5 Predictions:\n\n")
+    for i, pred in enumerate(all_preds, 1):
+        lbl = pred["class"].replace("Plant__", "").replace("", " ").title()
+        r   = get_risk(pred["class"], pred["confidence"])
+        diseases_box.insert(tk.END,
+            f"{i}. {lbl}\n"
+            f"   Confidence: {pred['confidence']:.1f}%  |  Risk: {r}%\n\n"
+        )
+    diseases_box.config(state="disabled")
+
+    # ---- Charts ----
+    draw_risk_graph(risk_frame, all_preds)
+    draw_class_pie(pie_frame,  all_preds)
+    notebook.select(tab_risk)
+def clear():
+    global image_path
+    image_path = None
+    img_label.config(image="", text="No image\nClick Upload")
+    img_label.image = None
+    _reset_results()
+
+    for w in risk_frame.winfo_children():
+        w.destroy()
+    tk.Label(risk_frame, text="Risk chart appears\nafter detection",
+             fg="#555", bg="#1e1e2e", font=("Courier New", 8)).pack(expand=True)
+
+    for w in pie_frame.winfo_children():
+        w.destroy()
+    tk.Label(pie_frame, text="Confidence chart appears\nafter detection",
+             fg="#555", bg="#1e1e2e", font=("Courier New", 8)).pack(expand=True)
+
+
+# -------------------------------------------------------
+# BUILD THE WINDOW
+# -------------------------------------------------------
+
+window = tk.Tk()
+window.title("Crop Disease Detector")
+window.geometry("1180x700")
+window.configure(bg="#1e1e2e")
+window.resizable(False, False)
+
+# Title bar
+tk.Label(window,
+         text="   Crop Disease Detection System",
+         font=("Courier New", 16, "bold"),
+         fg="#50fa7b", bg="#181825", pady=11
+         ).pack(fill=tk.X)
+
+main = tk.Frame(window, bg="#1e1e2e")
+main.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+
+# ========================
+# COL 1 — image + buttons + top-5 list
+# ========================
+col1 = tk.Frame(main, bg="#2a2a3e", width=255)
+col1.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 7))
+col1.pack_propagate(False)
+
+tk.Label(col1, text="Plant Leaf Image",
+         font=("Courier New", 9, "bold"), fg="white", bg="#2a2a3e"
+         ).pack(pady=(10, 3))
+
+img_label = tk.Label(col1, text="No image\nClick Upload",
+                     font=("Courier New", 9), fg="#666", bg="#12121e",
+                     width=31, height=10)
+img_label.pack(padx=7, pady=3)
+
+def btn(text, cmd, color):
+    tk.Button(col1, text=text, command=cmd,
+              font=("Courier New", 8, "bold"),
+              bg=color, fg="#1e1e2e",
+              relief="flat", cursor="hand2", pady=5
+              ).pack(fill=tk.X, padx=9, pady=2)
+
+btn("  Upload Image",   upload_image, "#50fa7b")
+btn("  Detect Disease", detect,       "#bd93f9")
+btn("  Clear",          clear,        "#ff5555")
+
+tk.Label(col1, text="Top 5 Predictions",
+         font=("Courier New", 8, "bold"), fg="white", bg="#2a2a3e"
+         ).pack(pady=(9, 2))
+
+diseases_box = tk.Text(col1, height=11,
+                       font=("Courier New", 7), fg="#cdd6f4", bg="#12121e",
+                       wrap=tk.WORD, relief="flat", padx=5, pady=5,
+                       state="disabled")
+diseases_box.pack(fill=tk.X, padx=7, pady=(0, 8))
+
+# ========================
+# COL 2 — result details
+# ========================
+col2 = tk.Frame(main, bg="#2a2a3e", width=330)
+col2.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 7))
+col2.pack_propagate(False)
+
+tk.Label(col2, text="Detection Result",
+         font=("Courier New", 9, "bold"), fg="white", bg="#2a2a3e"
+         ).pack(pady=(10, 3))
+esult_label = tk.Label(col2,
+                        text="Upload a leaf image and click Detect",
+                        font=("Courier New", 11, "bold"), fg="#888",
+                        bg="#12121e", wraplength=300, pady=8)
+result_label.pack(fill=tk.X, padx=9)
+
+status_badge = tk.Label(col2, text="",
+                        font=("Courier New", 9, "bold"),
+                        fg="#1e1e2e", bg="#1e1e2e", pady=3)
+status_badge.pack(pady=(2, 0))
+
+risk_label = tk.Label(col2, text="",
+                      font=("Courier New", 9, "bold"),
+                      fg="#f1fa8c", bg="#12121e")
+risk_label.pack(pady=(2, 2))
+
+summary_label = tk.Label(col2, text="",
+                         font=("Courier New", 8), fg="#cdd6f4",
+                         bg="#12121e", wraplength=300, justify=tk.LEFT)
+summary_label.pack(fill=tk.X, padx=9, pady=(0, 4))
+
+tk.Frame(col2, bg="#333355", height=1).pack(fill=tk.X, padx=9, pady=4)
+
+tk.Label(col2, text="Treatment Advice",
+         font=("Courier New", 9, "bold"), fg="white", bg="#2a2a3e"
+         ).pack(pady=(2, 2))
+
+advice_box = tk.Text(col2, height=7,
+                     font=("Courier New", 8), fg="#50fa7b", bg="#12121e",
+                     wrap=tk.WORD, relief="flat", padx=7, pady=7,
+                     state="disabled")
+advice_box.pack(fill=tk.X, padx=9)
+
+tk.Label(col2, text="Prevention Tips",
+         font=("Courier New", 9, "bold"), fg="white", bg="#2a2a3e"
+         ).pack(pady=(6, 2))
+
+prevent_box = tk.Text(col2, height=6,
+                      font=("Courier New", 8), fg="#bd93f9", bg="#12121e",
+                      wrap=tk.WORD, relief="flat", padx=7, pady=7,
+                      state="disabled")
+prevent_box.pack(fill=tk.BOTH, expand=True, padx=9, pady=(0, 9))
+
+# ========================
+# COL 3 — tabbed charts
+# ========================
+col3 = tk.Frame(main, bg="#2a2a3e")
+col3.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+tk.Label(col3, text="Analysis Charts",
+         font=("Courier New", 9, "bold"), fg="white", bg="#2a2a3e"
+         ).pack(pady=(10, 3))
+
+style = ttk.Style()
+style.theme_use("default")
+style.configure("TNotebook",     background="#2a2a3e", borderwidth=0)
+style.configure("TNotebook.Tab", background="#1e1e2e", foreground="#aaaaaa",
+                font=("Courier New", 8, "bold"), padding=[9, 3])
+style.map("TNotebook.Tab",
+          background=[("selected", "#12121e")],
+          foreground=[("selected", "#50fa7b")])
+style.configure("TFrame", background="#1e1e2e")
+
+notebook = ttk.Notebook(col3)
+notebook.pack(fill=tk.BOTH, expand=True, padx=7, pady=(0, 9))
+
+# Tab 1 — Risk bar chart
+tab_risk = ttk.Frame(notebook)
+notebook.add(tab_risk, text="Risk Analysis")
+risk_frame = tk.Frame(tab_risk, bg="#1e1e2e")
+risk_frame.pack(fill=tk.BOTH, expand=True)
+tk.Label(risk_frame, text="Risk chart appears after detection",
+         fg="#555", bg="#1e1e2e", font=("Courier New", 8)).pack(expand=True)
+
+# Tab 2 — Confidence pie chart
+tab_pie = ttk.Frame(notebook)
+notebook.add(tab_pie, text="Confidence Split")
+pie_frame = tk.Frame(tab_pie, bg="#1e1e2e")
+pie_frame.pack(fill=tk.BOTH, expand=True)
+tk.Label(pie_frame, text="Confidence chart appears after detection",
+         fg="#555", bg="#1e1e2e", font=("Courier New", 8)).pack(expand=True)
+# Tab 3 — Training history
+tab_train = ttk.Frame(notebook)
+notebook.add(tab_train, text="Training History")
+train_frame = tk.Frame(tab_train, bg="#1e1e2e")
+train_frame.pack(fill=tk.BOTH, expand=True)
+draw_training_graph(train_frame)   # loaded on startup
+
+# ---- Status bar ----
+if model:
+    sb_text  = f"Model Ready  |  {len(class_names)} classes  |  Upload a plant leaf image to begin"
+    sb_color = "#50fa7b"
+else:
+    sb_text  = "Model not found  —  run train_model.py first, then restart gui_app.py"
+    sb_color = "#ff5555"
+
+tk.Label(window, text=sb_text,
+         font=("Courier New", 8), fg=sb_color, bg="#181825", pady=4
+         ).pack(fill=tk.X, side=tk.BOTTOM)
+
+window.mainloop()
